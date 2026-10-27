@@ -1,0 +1,16 @@
+{
+  "name": "smtp-csv-mailer",
+  "version": "1.0.0",
+  "description": "Envia correos HTML por cada fila de un CSV usando una plantilla HTML",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^10.2.1"
+  }
+}
