@@ -20,6 +20,24 @@ function log(message, payload = "") {
   console.log(`[${timestamp}] ${message}`);
 }
 
+function redactEmail(value) {
+  if (!value) return "(empty)";
+  const str = String(value);
+  if (str.length <= 4) return "***";
+  return `${str.slice(0, 2)}***${str.slice(-2)}`;
+}
+
+function smtpConfigSummary() {
+  return {
+    host: process.env.SMTP_HOST || "(not set)",
+    port: process.env.SMTP_PORT || "(not set)",
+    secure: String(process.env.SMTP_SECURE || "false"),
+    user: redactEmail(process.env.SMTP_USER),
+    hasPass: Boolean(process.env.SMTP_PASS),
+    from: process.env.SMTP_FROM || process.env.SMTP_USER || "(not set)",
+  };
+}
+
 function normalizeKey(key = "") {
   return String(key)
     .trim()
@@ -56,25 +74,10 @@ function getCsvRows(csvText) {
   });
 }
 
-function guessEmailColumn(columns = []) {
-  const list = columns.map((column) => String(column).trim());
-  const match = list.find((column) => /email|correo|mail/i.test(column));
-  return match || list[0] || "email";
-}
-
-function getDisplayName(value, fallback = "") {
-  if (!value || !String(value).trim()) return fallback;
-  return String(value).trim();
-}
-
 function prettySubject(row, subjectColumn, defaultSubject) {
   if (!subjectColumn) return defaultSubject;
   const value = row[subjectColumn] ?? row[normalizeKey(subjectColumn)] ?? "";
   return value ? String(value).trim() : defaultSubject;
-}
-
-function makePreviewHtml(htmlTemplate, row) {
-  return renderTemplate(htmlTemplate, row || {});
 }
 
 function getTransporter() {
@@ -85,7 +88,7 @@ function getTransporter() {
     throw new Error(`Faltan configuraciones SMTP: ${missing.join(", ")}`);
   }
 
-  return nodemailer.createTransport({
+  const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false").toLowerCase() === "true",
@@ -96,7 +99,23 @@ function getTransporter() {
     tls: {
       rejectUnauthorized: false,
     },
+    logger: true,
+    debug: true,
   });
+
+  transporter.on("log", (info) => {
+    log("Nodemailer log event", { info });
+  });
+
+  transporter.on("error", (err) => {
+    log("Nodemailer transporter error", {
+      message: err && err.message,
+      stack: err && err.stack,
+      code: err && err.code,
+    });
+  });
+
+  return transporter;
 }
 
 async function processQueue(transporter) {
@@ -117,6 +136,7 @@ async function processQueue(transporter) {
         log(`Sending email to ${recipient} using column ${toColumn}.`, {
           subject,
           rowKeys: Object.keys(row),
+          attachmentCount: (attachments || []).length,
         });
 
         const mailOptions = {
@@ -124,23 +144,39 @@ async function processQueue(transporter) {
           to: recipient,
           subject,
           html: renderTemplate(htmlTemplate, row),
-          attachments: attachments.map((file) => ({
+          attachments: (attachments || []).map((file) => ({
             filename: file.originalname,
             content: file.buffer,
             contentType: file.mimetype,
           })),
         };
 
+        log("Mail options prepared", {
+          from: fromAddress,
+          to: recipient,
+          subject,
+          attachmentCount: mailOptions.attachments.length,
+        });
+
         const info = await transporter.sendMail(mailOptions);
-        log(`Email sent successfully to ${recipient}.`, { messageId: info.messageId });
+        log(`Email sent successfully to ${recipient}.`, {
+          messageId: info.messageId,
+          accepted: info.accepted,
+          rejected: info.rejected,
+          response: info.response,
+        });
         job.status = "sent";
       } catch (error) {
         log(`Failed sending to ${recipient}.`, {
-          error: error.message,
-          stack: error.stack,
+          message: error && error.message,
+          code: error && error.code,
+          responseCode: error && error.responseCode,
+          response: error && error.response,
+          command: error && error.command,
+          stack: error && error.stack,
         });
         job.status = "failed";
-        job.error = error.message;
+        job.error = error && error.message ? error.message : "Unknown error";
       }
     }
   } finally {
@@ -464,7 +500,6 @@ function buildPage() {
     '',
     "      let parsedColumns = [];",
     "      let sampleRows = [];",
-    "      let currentTemplate = '';",
     '',
     "      function setStatus(message, type = 'success') {",
     "        statusBox.textContent = message;",
@@ -541,7 +576,7 @@ function buildPage() {
     "          }",
     '',
     "          const headerLine = lines[0];",
-    "          const headers = headerLine.split(',').map((header) => header.trim().replace(/^\"|\"$/g, ''));",
+    "          const headers = headerLine.split(',').map((header) => header.trim().replace(/^\\"|\\"$/g, ''));",
     "          parsedColumns = headers.filter(Boolean);",
     '',
     "          const rows = [];",
@@ -549,7 +584,7 @@ function buildPage() {
     "            const values = lines[i].split(',');",
     "            const row = {};",
     "            headers.forEach((header, index) => {",
-    "              row[header] = (values[index] || '').trim().replace(/^\"|\"$/g, '');",
+    "              row[header] = (values[index] || '').trim().replace(/^\\"|\\"$/g, '');",
     "            });",
     "            rows.push(row);",
     "          }",
@@ -581,7 +616,6 @@ function buildPage() {
     '',
     "        try {",
     "          const templateHtml = await readTemplateFile(htmlFile);",
-    "          currentTemplate = templateHtml;",
     "          const row = sampleRows[0];",
     "          previewContent.innerHTML = renderTemplate(templateHtml, row);",
     "        } catch (error) {",
@@ -669,107 +703,156 @@ app.get("/", (req, res) => {
   res.type("html").send(buildPage());
 });
 
-app.post("/send", upload.fields([
-  { name: "htmlFile", maxCount: 1 },
-  { name: "csvFile", maxCount: 1 },
-  { name: "attachments", maxCount: 20 },
-]), async (req, res) => {
-  log("POST /send start", {
-    body: req.body,
-    files: Object.keys(req.files || {}),
-  });
+app.post(
+  "/send",
+  upload.fields([
+    { name: "htmlFile", maxCount: 1 },
+    { name: "csvFile", maxCount: 1 },
+    { name: "attachments", maxCount: 20 },
+  ]),
+  async (req, res) => {
+    log("POST /send start", {
+      body: req.body,
+      files: Object.keys(req.files || {}),
+    });
 
-  try {
-    const htmlFile = req.files?.htmlFile?.[0];
-    const csvFile = req.files?.csvFile?.[0];
-    const attachments = req.files?.attachments || [];
-    const toColumn = String(req.body.toColumn || "").trim();
-    const subjectColumn = String(req.body.subjectColumn || "").trim();
-    const subject = String(req.body.subject || "Notificación").trim() || "Notificación";
+    try {
+      const htmlFile = req.files?.htmlFile?.[0];
+      const csvFile = req.files?.csvFile?.[0];
+      const attachments = req.files?.attachments || [];
+      const toColumn = String(req.body.toColumn || "").trim();
+      const subjectColumn = String(req.body.subjectColumn || "").trim();
+      const subject = String(req.body.subject || "Notificación").trim() || "Notificación";
 
-    if (!htmlFile) {
-      log("POST /send rejected: missing htmlFile");
-      return res.status(400).json({ ok: false, message: "Falta la plantilla HTML." });
-    }
+      log("Request parsing details", {
+        toColumn,
+        subjectColumn,
+        subject,
+        attachmentCount: attachments.length,
+      });
 
-    if (!csvFile) {
-      log("POST /send rejected: missing csvFile");
-      return res.status(400).json({ ok: false, message: "Falta el archivo CSV." });
-    }
-
-    if (!toColumn) {
-      log("POST /send rejected: missing toColumn");
-      return res.status(400).json({ ok: false, message: "Falta la columna del destinatario." });
-    }
-
-    const htmlTemplate = htmlFile.buffer.toString("utf8");
-    const csvText = csvFile.buffer.toString("utf8");
-    const rows = getCsvRows(csvText);
-
-    if (!rows.length) {
-      log("POST /send rejected: CSV is empty");
-      return res.status(400).json({ ok: false, message: "El CSV no tiene filas de datos." });
-    }
-
-    const columns = Object.keys(rows[0]);
-    log("CSV parsed successfully", { rowCount: rows.length, columns });
-
-    const normalizedToColumn = columns.find((column) => normalizeKey(column) === normalizeKey(toColumn)) || toColumn;
-    const normalizedSubjectColumn = subjectColumn
-      ? columns.find((column) => normalizeKey(column) === normalizeKey(subjectColumn)) || subjectColumn
-      : "";
-
-    const transporter = getTransporter();
-    const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
-
-    rows.forEach((row) => {
-      const recipient = row[normalizedToColumn] ?? row[normalizeKey(normalizedToColumn)] ?? "";
-      if (!recipient) {
-        log("Skipping row without recipient", { row });
-        return;
+      if (!htmlFile) {
+        log("POST /send rejected: missing htmlFile");
+        return res.status(400).json({ ok: false, message: "Falta la plantilla HTML." });
       }
 
-      const rowSubject = prettySubject(row, normalizedSubjectColumn, subject);
-      queue.push({
-        row,
-        htmlTemplate,
-        recipient: String(recipient).trim(),
-        subject: rowSubject,
-        attachments,
-        toColumn: normalizedToColumn,
-        fromAddress,
+      if (!csvFile) {
+        log("POST /send rejected: missing csvFile");
+        return res.status(400).json({ ok: false, message: "Falta el archivo CSV." });
+      }
+
+      if (!toColumn) {
+        log("POST /send rejected: missing toColumn");
+        return res.status(400).json({ ok: false, message: "Falta la columna del destinatario." });
+      }
+
+      const htmlTemplate = htmlFile.buffer.toString("utf8");
+      const csvText = csvFile.buffer.toString("utf8");
+      const rows = getCsvRows(csvText);
+
+      log("CSV parsed", {
+        rowCount: rows.length,
+        columns: rows[0] ? Object.keys(rows[0]) : [],
+        preview: rows[0] || null,
       });
-    });
 
-    log("Queue populated", { queueLength: queue.length });
+      if (!rows.length) {
+        log("POST /send rejected: CSV is empty");
+        return res.status(400).json({ ok: false, message: "El CSV no tiene filas de datos." });
+      }
 
-    if (!queue.length) {
-      return res.status(400).json({ ok: false, message: "No se encontraron destinatarios válidos en el CSV." });
+      const columns = Object.keys(rows[0]);
+      const normalizedToColumn = columns.find((column) => normalizeKey(column) === normalizeKey(toColumn)) || toColumn;
+      const normalizedSubjectColumn = subjectColumn
+        ? columns.find((column) => normalizeKey(column) === normalizeKey(subjectColumn)) || subjectColumn
+        : "";
+
+      log("Column resolution", {
+        requestedToColumn: toColumn,
+        normalizedToColumn,
+        requestedSubjectColumn: subjectColumn,
+        normalizedSubjectColumn,
+      });
+
+      const transporter = getTransporter();
+      log("SMTP config loaded", smtpConfigSummary());
+
+      try {
+        log("SMTP verify start");
+        await transporter.verify();
+        log("SMTP verification successful.");
+      } catch (smtpError) {
+        log("SMTP verification failed", {
+          message: smtpError && smtpError.message,
+          code: smtpError && smtpError.code,
+          response: smtpError && smtpError.response,
+          responseCode: smtpError && smtpError.responseCode,
+          command: smtpError && smtpError.command,
+          stack: smtpError && smtpError.stack,
+        });
+        throw smtpError;
+      }
+
+      const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+      const queuedJobs = [];
+
+      rows.forEach((row, index) => {
+        const recipient = row[normalizedToColumn] ?? row[normalizeKey(normalizedToColumn)] ?? "";
+        if (!recipient) {
+          log(`Skipping row without recipient`, { index, row });
+          return;
+        }
+
+        const rowSubject = prettySubject(row, normalizedSubjectColumn, subject);
+        queuedJobs.push({
+          row,
+          htmlTemplate,
+          recipient: String(recipient).trim(),
+          subject: rowSubject,
+          attachments,
+          toColumn: normalizedToColumn,
+          fromAddress,
+        });
+      });
+
+      log("Queue populated with jobs", { queueLength: queuedJobs.length });
+      queuedJobs.forEach((job) => queue.push(job));
+
+      if (!queue.length) {
+        return res.status(400).json({ ok: false, message: "No se encontraron destinatarios válidos en el CSV." });
+      }
+
+      log("Starting queue processing before returning HTTP response.");
+      await processQueue(transporter);
+
+      const sentCount = queue.filter((job) => job.status === "sent").length;
+      const failedCount = queue.filter((job) => job.status === "failed").length;
+      log("Queue completed", { sentCount, failedCount, total: queue.length });
+
+      return res.status(200).json({
+        ok: true,
+        sent: sentCount,
+        failed: failedCount,
+        queued: queue.length,
+        message: `Envíos finalizados. Correctos: ${sentCount}. Fallidos: ${failedCount}.`,
+      });
+    } catch (error) {
+      log("Post /send error", {
+        message: error && error.message,
+        code: error && error.code,
+        response: error && error.response,
+        responseCode: error && error.responseCode,
+        command: error && error.command,
+        stack: error && error.stack,
+      });
+
+      return res.status(500).json({
+        ok: false,
+        message: error && error.message ? error.message : "Error al procesar la solicitud.",
+      });
     }
-
-    processQueue(transporter).catch((error) => {
-      log("Queue processing failed unexpectedly", {
-        error: error.message,
-        stack: error.stack,
-      });
-    });
-
-    return res.status(202).json({
-      ok: true,
-      queued: queue.length,
-      message: `Se han agregado ${queue.length} mensajes a la cola de envío. El proceso continúa en segundo plano.`,
-    });
-  } catch (error) {
-    log("Post /send error", {
-      error: error.message,
-      stack: error.stack,
-    });
-    return res.status(500).json({
-      ok: false,
-      message: error.message || "Error al procesar la solicitud.",
-    });
   }
-});
+);
 
 app.use((req, res) => {
   log(`Unhandled route: ${req.method} ${req.originalUrl}`);
@@ -779,4 +862,5 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   log(`Servidor activo en http://localhost:${PORT}`);
   log(`SMTP environment loaded: ${Boolean(process.env.SMTP_HOST)}`);
+  log("SMTP config summary", smtpConfigSummary());
 });
