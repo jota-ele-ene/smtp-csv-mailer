@@ -564,8 +564,8 @@ function buildPage() {
           }
 
           sampleRows = rows;
-          rowCountChip.textContent = `Filas: ${rows.length}`;
-          columnsChip.textContent = `Columnas: ${parsedColumns.length}`;
+          rowCountChip.textContent = `Filas: \${rows.length}`;
+          columnsChip.textContent = `Columnas: \${parsedColumns.length}`;
 
           let emailColumn = parsedColumns.find((column) => /email|correo|mail/i.test(column)) || parsedColumns[0] || 'email';
           populateSelect(toColumnSelect, parsedColumns, emailColumn);
